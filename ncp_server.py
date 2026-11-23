@@ -3,6 +3,7 @@ import time
 import hmac
 import hashlib
 import base64
+import ssl
 from typing import Optional
 from urllib.parse import urlencode
 import requests
@@ -56,8 +57,26 @@ def _sign(method: str, path: str) -> dict:
         "x-ncp-apigw-signature-v2": signature,
     }
 
+class _SystemCAAdapter(requests.adapters.HTTPAdapter):
+    """시스템 CA 묶음을 신뢰하고 VERIFY_X509_STRICT만 끈다 (인증서 검증은 유지).
+
+    사내 TLS 검사 루트 CA가 AKI 확장이 없어 Python 3.13+ 엄격 검사에서 거부되는 문제 대응.
+    """
+
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = ssl.create_default_context(cafile=CA_BUNDLE)
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+
+CA_BUNDLE = os.environ.get("NCP_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
+_http = requests.Session()
+_http.mount("https://", _SystemCAAdapter())
+
+
 def _get(path: str) -> dict:
-    res = requests.get(BASE_URL + path, headers=_sign("GET", path))
+    res = _http.get(BASE_URL + path, headers=_sign("GET", path))
     try:
         return res.json()
     except ValueError:
@@ -201,7 +220,7 @@ def _wait_for(get_status, target: str, timeout: int = 120, interval: float = 2.0
 
 
 def _find_vpc_by_name(name: str, region_code: str) -> Optional[dict]:
-    res = _get(f"/vpc/v2/getVpcList?regionCode={region_code}")
+    res = _get(_build_path("/vpc/v2/getVpcList", {"regionCode": region_code}))
     for v in (res.get("getVpcListResponse") or {}).get("vpcList") or []:
         if v.get("vpcName") == name:
             return v
@@ -224,7 +243,7 @@ def _get_my_ip() -> Optional[str]:
     조회 실패 시 None 반환 → 호출 측에서 myip 규칙을 건너뛴다.
     """
     try:
-        r = requests.get("https://api.ipify.org", timeout=5)
+        r = _http.get("https://api.ipify.org", timeout=5)
         if r.status_code == 200:
             ip = r.text.strip()
             if ip:
@@ -253,7 +272,7 @@ def list_servers(region_code: str = "KR") -> dict:
     응답 항목 키: no, name, status, op, pubIp, priIp, spec, image,
     vpcNo, subnetNo, zone, loginKey, termProtect.
     """
-    res = _get(f"/vserver/v2/getServerInstanceList?regionCode={region_code}")
+    res = _get(_build_path("/vserver/v2/getServerInstanceList", {"regionCode": region_code}))
     return _slim_list(res, "getServerInstanceListResponse",
                       "serverInstanceList", _slim_server)
 
@@ -263,16 +282,17 @@ def list_vpcs(region_code: str = "KR") -> dict:
 
     응답 항목 키: no, name, cidr, status, region.
     """
-    res = _get(f"/vpc/v2/getVpcList?regionCode={region_code}")
+    res = _get(_build_path("/vpc/v2/getVpcList", {"regionCode": region_code}))
     return _slim_list(res, "getVpcListResponse", "vpcList", _slim_vpc)
 
 @mcp.tool()
 def get_server_detail(server_instance_no: str,
                       region_code: str = "KR") -> dict:
     """특정 서버의 상세 정보를 조회합니다. (list_servers와 동일 스키마)"""
-    path = (f"/vserver/v2/getServerInstanceList"
-            f"?regionCode={region_code}"
-            f"&serverInstanceNoList={server_instance_no}")
+    path = _build_path("/vserver/v2/getServerInstanceList", {
+        "regionCode": region_code,
+        "serverInstanceNoList.1": server_instance_no,
+    })
     res = _get(path)
     return _slim_list(res, "getServerInstanceListResponse",
                       "serverInstanceList", _slim_server)
@@ -544,10 +564,12 @@ def create_access_control_group(vpc_no: str,
 def _build_acg_rule_path(endpoint: str,
                         access_control_group_no: str,
                         rules: list,
-                        region_code: str) -> str:
+                        region_code: str,
+                        vpc_no: str = "") -> str:
     """ACG 규칙 추가용 path 생성 (inbound/outbound 공통)."""
     params: dict = {
         "regionCode":             region_code,
+        "vpcNo":                  vpc_no,
         "accessControlGroupNo":   access_control_group_no,
     }
     params.update(_flatten_dict_list("accessControlGroupRuleList", rules))
@@ -557,7 +579,8 @@ def _build_acg_rule_path(endpoint: str,
 @mcp.tool()
 def add_acg_inbound_rule(access_control_group_no: str,
                          rules: list,
-                         region_code: str = "KR") -> dict:
+                         region_code: str = "KR",
+                         vpc_no: str = "") -> dict:
     """ACG에 inbound(수신) 규칙을 추가합니다.
 
     참고: https://api.ncloud-docs.com/docs/networking-vpc-addaccesscontrolgroupinboundrule
@@ -581,7 +604,7 @@ def add_acg_inbound_rule(access_control_group_no: str,
     """
     path = _build_acg_rule_path(
         "/vserver/v2/addAccessControlGroupInboundRule",
-        access_control_group_no, rules, region_code,
+        access_control_group_no, rules, region_code, vpc_no,
     )
     return _get(path)
 
@@ -589,7 +612,8 @@ def add_acg_inbound_rule(access_control_group_no: str,
 @mcp.tool()
 def add_acg_outbound_rule(access_control_group_no: str,
                           rules: list,
-                          region_code: str = "KR") -> dict:
+                          region_code: str = "KR",
+                          vpc_no: str = "") -> dict:
     """ACG에 outbound(송신) 규칙을 추가합니다.
 
     참고: https://api.ncloud-docs.com/docs/networking-vpc-addaccesscontrolgroupoutboundrule
@@ -608,7 +632,7 @@ def add_acg_outbound_rule(access_control_group_no: str,
     """
     path = _build_acg_rule_path(
         "/vserver/v2/addAccessControlGroupOutboundRule",
-        access_control_group_no, rules, region_code,
+        access_control_group_no, rules, region_code, vpc_no,
     )
     return _get(path)
 
@@ -1001,6 +1025,458 @@ def assign_public_ip(serverInstanceNo: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Network 조회·규칙 관리 — ACG/NACL 규칙, 라우트 테이블, NAT Gateway, 서버 NIC.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flat(v):
+    """{code, codeName} enum은 code만 남기고, 빈 값은 버린 사본을 반환."""
+    if isinstance(v, dict):
+        if set(v) <= {"code", "codeName"} and "code" in v:
+            return v["code"]
+        return {k: _flat(x) for k, x in v.items() if x not in (None, "", [])}
+    if isinstance(v, list):
+        return [_flat(x) for x in v]
+    return v
+
+
+def _list_raw(res: dict, response_key: str, list_key: str) -> dict:
+    """_slim_list와 같은 봉투 처리, 항목은 _flat만 적용."""
+    return _slim_list(res, response_key, list_key, _flat)
+
+
+@mcp.tool()
+def get_server_network(server_instance_no: str,
+                       region_code: str = "KR") -> dict:
+    """서버의 NIC 목록(사설 IP, 서브넷, 적용된 ACG 번호)을 조회합니다."""
+    res = _get(_build_path("/vserver/v2/getServerInstanceList", {
+        "regionCode": region_code,
+        "serverInstanceNoList.1": server_instance_no,
+    }))
+    if "error" in res:
+        return res
+    servers = (res.get("getServerInstanceListResponse") or {}).get("serverInstanceList") or []
+    if not servers:
+        return {"error": f"server {server_instance_no} not found"}
+    nic_nos = servers[0].get("networkInterfaceNoList") or []
+    params: dict = {"regionCode": region_code}
+    for i, no in enumerate(nic_nos, start=1):
+        params[f"networkInterfaceNoList.{i}"] = no
+    res = _get(_build_path("/vserver/v2/getNetworkInterfaceList", params))
+    return _list_raw(res, "getNetworkInterfaceListResponse", "networkInterfaceList")
+
+
+@mcp.tool()
+def list_acg_rules(access_control_group_no: str,
+                   rule_type: str = "",
+                   region_code: str = "KR") -> dict:
+    """ACG 규칙 목록을 조회합니다.
+
+    Args:
+        access_control_group_no: ACG 번호 — 필수
+        rule_type: "INBND" · "OTBND" (생략 시 전체)
+        region_code: 리전 코드
+    """
+    res = _get(_build_path("/vserver/v2/getAccessControlGroupRuleList", {
+        "regionCode":                     region_code,
+        "accessControlGroupNo":           access_control_group_no,
+        "accessControlGroupRuleTypeCode": rule_type,
+    }))
+    return _list_raw(res, "getAccessControlGroupRuleListResponse",
+                     "accessControlGroupRuleList")
+
+
+def _remove_acg_rule(endpoint: str, vpc_no: str, access_control_group_no: str,
+                     rules: list, region_code: str) -> dict:
+    params: dict = {
+        "regionCode":           region_code,
+        "vpcNo":                vpc_no,
+        "accessControlGroupNo": access_control_group_no,
+    }
+    params.update(_flatten_dict_list("accessControlGroupRuleList", rules))
+    return _get(_build_path(endpoint, params))
+
+
+@mcp.tool()
+def remove_acg_inbound_rule(vpc_no: str,
+                            access_control_group_no: str,
+                            rules: list,
+                            region_code: str = "KR") -> dict:
+    """ACG inbound 규칙을 삭제합니다.
+
+    rules 각 항목은 list_acg_rules로 본 규칙과 정확히 일치해야 한다:
+    protocolTypeCode, ipBlock 또는 accessControlGroupSequence, portRange(TCP/UDP).
+    """
+    return _remove_acg_rule("/vserver/v2/removeAccessControlGroupInboundRule",
+                            vpc_no, access_control_group_no, rules, region_code)
+
+
+@mcp.tool()
+def remove_acg_outbound_rule(vpc_no: str,
+                             access_control_group_no: str,
+                             rules: list,
+                             region_code: str = "KR") -> dict:
+    """ACG outbound 규칙을 삭제합니다. (rules 형식은 remove_acg_inbound_rule과 동일)"""
+    return _remove_acg_rule("/vserver/v2/removeAccessControlGroupOutboundRule",
+                            vpc_no, access_control_group_no, rules, region_code)
+
+
+@mcp.tool()
+def list_network_acl_rules(network_acl_no: str,
+                           rule_type: str = "",
+                           region_code: str = "KR") -> dict:
+    """Network ACL 규칙 목록을 조회합니다.
+
+    Args:
+        network_acl_no: NACL 번호 — 필수
+        rule_type: "INBND" · "OTBND" (생략 시 전체)
+        region_code: 리전 코드
+    """
+    params: dict = {"regionCode": region_code, "networkAclNo": network_acl_no}
+    if rule_type:
+        params["networkAclRuleTypeCodeList.1"] = rule_type
+    res = _get(_build_path("/vpc/v2/getNetworkAclRuleList", params))
+    return _list_raw(res, "getNetworkAclRuleListResponse", "networkAclRuleList")
+
+
+def _nacl_rule(endpoint: str, network_acl_no: str, rules: list,
+               region_code: str) -> dict:
+    params: dict = {"regionCode": region_code, "networkAclNo": network_acl_no}
+    params.update(_flatten_dict_list("networkAclRuleList", rules))
+    return _get(_build_path(endpoint, params))
+
+
+_NACL_RULE_DOC = """
+    rules: list[dict]. 각 dict 키:
+        - priority (필수): 0~199, 낮을수록 먼저 평가
+        - protocolTypeCode (필수): "TCP" · "UDP" · "ICMP"
+        - ipBlock (필수): IPv4 CIDR
+        - ruleActionCode (필수): "ALLOW" · "DROP"
+        - portRange (TCP/UDP 필수): "443", "1-65535"
+        - networkAclRuleDescription (선택)
+"""
+_NACL_REMOVE_NOTE = "규칙은 list_network_acl_rules 결과와 정확히 일치해야 한다.\n"
+
+
+@mcp.tool(description="NACL inbound 규칙을 추가합니다.\n" + _NACL_RULE_DOC)
+def add_network_acl_inbound_rule(network_acl_no: str, rules: list,
+                                 region_code: str = "KR") -> dict:
+    return _nacl_rule("/vpc/v2/addNetworkAclInboundRule",
+                      network_acl_no, rules, region_code)
+
+
+@mcp.tool(description="NACL outbound 규칙을 추가합니다.\n" + _NACL_RULE_DOC)
+def add_network_acl_outbound_rule(network_acl_no: str, rules: list,
+                                  region_code: str = "KR") -> dict:
+    return _nacl_rule("/vpc/v2/addNetworkAclOutboundRule",
+                      network_acl_no, rules, region_code)
+
+
+@mcp.tool(description="NACL inbound 규칙을 삭제합니다. " + _NACL_REMOVE_NOTE + _NACL_RULE_DOC)
+def remove_network_acl_inbound_rule(network_acl_no: str, rules: list,
+                                    region_code: str = "KR") -> dict:
+    return _nacl_rule("/vpc/v2/removeNetworkAclInboundRule",
+                      network_acl_no, rules, region_code)
+
+
+@mcp.tool(description="NACL outbound 규칙을 삭제합니다. " + _NACL_REMOVE_NOTE + _NACL_RULE_DOC)
+def remove_network_acl_outbound_rule(network_acl_no: str, rules: list,
+                                     region_code: str = "KR") -> dict:
+    return _nacl_rule("/vpc/v2/removeNetworkAclOutboundRule",
+                      network_acl_no, rules, region_code)
+
+
+@mcp.tool()
+def list_route_tables(vpc_no: str = "", region_code: str = "KR") -> dict:
+    """라우트 테이블 목록을 조회합니다."""
+    res = _get(_build_path("/vpc/v2/getRouteTableList", {
+        "regionCode": region_code, "vpcNo": vpc_no,
+    }))
+    return _list_raw(res, "getRouteTableListResponse", "routeTableList")
+
+
+@mcp.tool()
+def list_routes(vpc_no: str, route_table_no: str,
+                region_code: str = "KR") -> dict:
+    """라우트 테이블의 라우트(목적지 CIDR → 대상) 목록을 조회합니다."""
+    res = _get(_build_path("/vpc/v2/getRouteList", {
+        "regionCode": region_code, "vpcNo": vpc_no, "routeTableNo": route_table_no,
+    }))
+    return _list_raw(res, "getRouteListResponse", "routeList")
+
+
+@mcp.tool()
+def list_route_table_subnets(vpc_no: str, route_table_no: str,
+                             region_code: str = "KR") -> dict:
+    """라우트 테이블에 연결된 서브넷 목록을 조회합니다."""
+    res = _get(_build_path("/vpc/v2/getRouteTableSubnetList", {
+        "regionCode": region_code, "vpcNo": vpc_no, "routeTableNo": route_table_no,
+    }))
+    return _list_raw(res, "getRouteTableSubnetListResponse", "subnetList")
+
+
+@mcp.tool()
+def list_network_interfaces(subnet_no: str = "",
+                            vpc_no: str = "",
+                            region_code: str = "KR") -> dict:
+    """NIC 목록을 조회합니다. 일반 서버 외에 관리형 서비스(Cloud DB 등)가 만든 NIC도 포함.
+
+    subnet_no / vpc_no 필터는 전체 목록을 받아 클라이언트에서 적용한다.
+    항목의 instanceType · instanceNo로 어떤 리소스의 NIC인지 구분한다.
+    """
+    items: list = []
+    page = 1
+    while True:
+        res = _get(_build_path("/vserver/v2/getNetworkInterfaceList", {
+            "regionCode": region_code, "pageNo": page, "pageSize": 1000,
+        }))
+        if "error" in res:
+            return res
+        inner = res.get("getNetworkInterfaceListResponse") or {}
+        batch = inner.get("networkInterfaceList") or []
+        items.extend(batch)
+        if not batch or len(items) >= int(inner.get("totalRows") or 0):
+            break
+        page += 1
+    if subnet_no:
+        items = [x for x in items if str(x.get("subnetNo")) == str(subnet_no)]
+    if vpc_no:
+        subnets = _get(_build_path("/vpc/v2/getSubnetList", {
+            "regionCode": region_code, "vpcNo": vpc_no,
+        }))
+        nos = {str(s.get("subnetNo")) for s in
+               (subnets.get("getSubnetListResponse") or {}).get("subnetList") or []}
+        items = [x for x in items if str(x.get("subnetNo")) in nos]
+    return {"count": len(items), "items": [_flat(x) for x in items]}
+
+
+# db_type → (API 경로 prefix, 응답 키 접두어)
+_CLOUD_DB = {
+    "mysql":      ("/vmysql/v2/getCloudMysqlInstanceList",           "Mysql"),
+    "redis":      ("/vredis/v2/getCloudRedisInstanceList",           "Redis"),
+    "mongodb":    ("/vmongodb/v2/getCloudMongoDbInstanceList",       "MongoDb"),
+    "postgresql": ("/vpostgresql/v2/getCloudPostgresqlInstanceList", "Postgresql"),
+    "mssql":      ("/vmssql/v2/getCloudMssqlInstanceList",           "Mssql"),
+}
+
+
+@mcp.tool()
+def list_cloud_db_instances(db_type: str = "",
+                            vpc_no: str = "",
+                            region_code: str = "KR") -> dict:
+    """Cloud DB 인스턴스 목록을 조회합니다 (노드별 서브넷·사설 IP 포함).
+
+    Args:
+        db_type: "mysql" · "redis" · "mongodb" · "postgresql" · "mssql" (생략 시 전부)
+        vpc_no: 특정 VPC만 (선택)
+        region_code: 리전 코드
+    결과는 db_type별로 묶인다. 상품 미사용·권한 없음 등 실패한 타입은 error로 표시된다.
+    """
+    types = [db_type] if db_type else list(_CLOUD_DB)
+    out: dict = {}
+    for t in types:
+        if t not in _CLOUD_DB:
+            out[t] = {"error": f"unknown db_type: {t}"}
+            continue
+        endpoint, key = _CLOUD_DB[t]
+        res = _get(_build_path(endpoint, {"regionCode": region_code, "vpcNo": vpc_no}))
+        out[t] = _list_raw(res, f"getCloud{key}InstanceListResponse",
+                           f"cloud{key}InstanceList")
+    return out
+
+
+@mcp.tool()
+def list_nat_gateways(vpc_no: str = "", region_code: str = "KR") -> dict:
+    """NAT Gateway 목록을 조회합니다."""
+    res = _get(_build_path("/vpc/v2/getNatGatewayInstanceList", {
+        "regionCode": region_code, "vpcNo": vpc_no,
+    }))
+    return _list_raw(res, "getNatGatewayInstanceListResponse", "natGatewayInstanceList")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load Balancer 조회 — LB → 리스너 → 규칙 → 타깃 그룹 → 타깃 순으로 따라간다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_load_balancers(vpc_no: str = "",
+                        load_balancer_type_code: str = "",
+                        load_balancer_network_type_code: str = "",
+                        load_balancer_instance_no_list: Optional[list] = None,
+                        region_code: str = "KR") -> dict:
+    """Load Balancer 인스턴스 목록을 조회합니다 (도메인, IP, 서브넷, 리스너 번호 포함).
+
+    Args:
+        vpc_no: 특정 VPC만 (선택)
+        load_balancer_type_code: "APPLICATION" · "NETWORK" · "NETWORK_PROXY" (선택)
+        load_balancer_network_type_code: "PUBLIC" · "PRIVATE" (선택)
+        load_balancer_instance_no_list: 특정 LB 번호 필터 (선택, list[str])
+        region_code: 리전 코드
+    """
+    params: dict = {
+        "regionCode": region_code, "vpcNo": vpc_no,
+        "loadBalancerTypeCode": load_balancer_type_code,
+        "loadBalancerNetworkTypeCode": load_balancer_network_type_code,
+    }
+    for i, no in enumerate(load_balancer_instance_no_list or [], start=1):
+        params[f"loadBalancerInstanceNoList.{i}"] = no
+    res = _get(_build_path("/vloadbalancer/v2/getLoadBalancerInstanceList", params))
+    return _list_raw(res, "getLoadBalancerInstanceListResponse", "loadBalancerInstanceList")
+
+
+@mcp.tool()
+def list_load_balancer_listeners(load_balancer_instance_no: str,
+                                 region_code: str = "KR") -> dict:
+    """LB의 리스너 목록(프로토콜, 포트, 인증서, 규칙 번호)을 조회합니다."""
+    res = _get(_build_path("/vloadbalancer/v2/getLoadBalancerListenerList", {
+        "regionCode": region_code, "loadBalancerInstanceNo": load_balancer_instance_no,
+    }))
+    return _list_raw(res, "getLoadBalancerListenerListResponse", "loadBalancerListenerList")
+
+
+@mcp.tool()
+def list_load_balancer_rules(load_balancer_listener_no: str,
+                             region_code: str = "KR") -> dict:
+    """리스너의 규칙 목록(조건 → 타깃 그룹)을 조회합니다. 타깃 그룹 번호는 여기서 얻는다."""
+    res = _get(_build_path("/vloadbalancer/v2/getLoadBalancerRuleList", {
+        "regionCode": region_code, "loadBalancerListenerNo": load_balancer_listener_no,
+    }))
+    return _list_raw(res, "getLoadBalancerRuleListResponse", "loadBalancerRuleList")
+
+
+@mcp.tool()
+def list_target_groups(vpc_no: str = "",
+                       target_group_no_list: Optional[list] = None,
+                       region_code: str = "KR") -> dict:
+    """타깃 그룹 목록(프로토콜, 포트, 헬스체크, 연결된 LB, 타깃 번호)을 조회합니다.
+
+    Args:
+        vpc_no: 특정 VPC만 (선택)
+        target_group_no_list: 특정 타깃 그룹 번호 필터 (선택, list[str])
+        region_code: 리전 코드
+    """
+    params: dict = {"regionCode": region_code, "vpcNo": vpc_no}
+    for i, no in enumerate(target_group_no_list or [], start=1):
+        params[f"targetGroupNoList.{i}"] = no
+    res = _get(_build_path("/vloadbalancer/v2/getTargetGroupList", params))
+    return _list_raw(res, "getTargetGroupListResponse", "targetGroupList")
+
+
+@mcp.tool()
+def list_targets(target_group_no: str, region_code: str = "KR") -> dict:
+    """타깃 그룹에 등록된 타깃(이름, IP, 헬스체크 상태)을 조회합니다."""
+    res = _get(_build_path("/vloadbalancer/v2/getTargetList", {
+        "regionCode": region_code, "targetGroupNo": target_group_no,
+    }))
+    return _list_raw(res, "getTargetListResponse", "targetList")
+
+
+@mcp.tool()
+def create_target_group(vpc_no: str,
+                        target_group_protocol_type_code: str,
+                        health_check_protocol_type_code: str,
+                        target_group_name: str = "",
+                        target_group_port: Optional[int] = None,
+                        target_group_description: str = "",
+                        health_check_port: Optional[int] = None,
+                        health_check_url_path: str = "",
+                        health_check_http_method_type_code: str = "",
+                        target_no_list: Optional[list] = None,
+                        region_code: str = "KR") -> dict:
+    """타깃 그룹을 생성합니다 (타깃 유형 VSVR).
+
+    Args:
+        vpc_no: VPC 번호 — 필수
+        target_group_protocol_type_code: "HTTP" · "HTTPS" (ALB) · "TCP" · "UDP" (NLB) · "PROXY_TCP" — 필수
+        health_check_protocol_type_code: HTTP/HTTPS 그룹은 "HTTP" · "HTTPS", 그 외는 "TCP" — 필수
+        target_group_name: 3-30자, 영문자로 시작 (생략 시 자동 부여)
+        target_group_port: 타깃 포트 (기본 80)
+        health_check_port: 헬스체크 포트 (기본 80). 타깃 포트와 달라도 된다.
+        health_check_url_path: "/"로 시작 (HTTP/HTTPS 헬스체크만)
+        health_check_http_method_type_code: "HEAD" · "GET" (HTTP/HTTPS 헬스체크면 필수)
+        target_no_list: 생성과 동시에 등록할 서버 인스턴스 번호 (선택, list[str])
+        region_code: 리전 코드
+    """
+    params: dict = {
+        "regionCode": region_code, "vpcNo": vpc_no, "targetTypeCode": "VSVR",
+        "targetGroupName": target_group_name,
+        "targetGroupProtocolTypeCode": target_group_protocol_type_code,
+        "targetGroupPort": target_group_port,
+        "targetGroupDescription": target_group_description,
+        "healthCheckProtocolTypeCode": health_check_protocol_type_code,
+        "healthCheckPort": health_check_port,
+        "healthCheckUrlPath": health_check_url_path,
+        "healthCheckHttpMethodTypeCode": health_check_http_method_type_code,
+    }
+    for i, no in enumerate(target_no_list or [], start=1):
+        params[f"targetNoList.{i}"] = no
+    res = _get(_build_path("/vloadbalancer/v2/createTargetGroup", params))
+    return _list_raw(res, "createTargetGroupResponse", "targetGroupList")
+
+
+@mcp.tool()
+def add_targets(target_group_no: str, target_no_list: list,
+                region_code: str = "KR") -> dict:
+    """타깃 그룹에 서버(타깃)를 등록합니다. target_no_list: 서버 인스턴스 번호 list[str]."""
+    params: dict = {"regionCode": region_code, "targetGroupNo": target_group_no}
+    for i, no in enumerate(target_no_list, start=1):
+        params[f"targetNoList.{i}"] = no
+    res = _get(_build_path("/vloadbalancer/v2/addTarget", params))
+    return _list_raw(res, "addTargetResponse", "targetList")
+
+
+@mcp.tool()
+def create_load_balancer_listener(load_balancer_instance_no: str,
+                                  protocol_type_code: str,
+                                  port: int,
+                                  target_group_no: str,
+                                  ssl_certificate_no: str = "",
+                                  tls_min_version_type_code: str = "",
+                                  use_http2: Optional[bool] = None,
+                                  region_code: str = "KR") -> dict:
+    """LB에 리스너를 추가합니다. target_group_no가 리스너의 기본 규칙이 된다.
+
+    Args:
+        load_balancer_instance_no: LB 번호 — 필수
+        protocol_type_code: ALB "HTTP" · "HTTPS", NLB "TCP" · "UDP", 프록시 LB "TCP" · "TLS" — 필수
+        port: 리스너 포트 (기존 리스너와 중복 불가) — 필수
+        target_group_no: 다른 LB에서 쓰지 않는 타깃 그룹 — 필수
+        ssl_certificate_no: HTTPS · TLS면 필수 (기존 리스너의 sslCertificateNo 재사용 가능)
+        tls_min_version_type_code: "TLSV10" (기본) · "TLSV11" · "TLSV12"
+        use_http2: HTTPS 리스너만
+        region_code: 리전 코드
+    """
+    res = _get(_build_path("/vloadbalancer/v2/createLoadBalancerListener", {
+        "regionCode": region_code,
+        "loadBalancerInstanceNo": load_balancer_instance_no,
+        "protocolTypeCode": protocol_type_code,
+        "port": port,
+        "targetGroupNo": target_group_no,
+        "sslCertificateNo": ssl_certificate_no,
+        "tlsMinVersionTypeCode": tls_min_version_type_code,
+        "useHttp2": None if use_http2 is None else str(use_http2).lower(),
+    }))
+    return _list_raw(res, "createLoadBalancerListenerResponse", "loadBalancerListenerList")
+
+
+@mcp.tool()
+def delete_load_balancer_listener(load_balancer_listener_no: str,
+                                  region_code: str = "KR") -> dict:
+    """LB 리스너를 삭제합니다 (되돌릴 수 없음)."""
+    return _get(_build_path("/vloadbalancer/v2/deleteLoadBalancerListeners", {
+        "regionCode": region_code,
+        "loadBalancerListenerNoList.1": load_balancer_listener_no,
+    }))
+
+
+@mcp.tool()
+def delete_target_group(target_group_no: str, region_code: str = "KR") -> dict:
+    """타깃 그룹을 삭제합니다 (LB에서 쓰는 중이면 실패, 되돌릴 수 없음)."""
+    return _get(_build_path("/vloadbalancer/v2/deleteTargetGroups", {
+        "regionCode": region_code, "targetGroupNoList.1": target_group_no,
+    }))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Object Storage (S3 호환 API, boto3 사용)
 # ─────────────────────────────────────────────────────────────────────────────
 # NCP Object Storage는 region별 S3 호환 엔드포인트를 제공한다.
@@ -1224,5 +1700,9 @@ def delete_bucket(bucket_name: str,
         return {"error": str(e)}
 
 
-if __name__ == "__main__":
+def main():
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
