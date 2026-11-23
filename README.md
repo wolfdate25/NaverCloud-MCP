@@ -44,30 +44,53 @@ uv sync
 
 uv 없이 쓰려면 `python -m venv .venv && .venv/bin/pip install -r requirements.txt` 로 설치해도 됩니다.
 
-## 인증키 설정
+## 인증 설정
 
-1. NCP 콘솔 → 마이페이지 → 계정 관리 → [인증키 관리](https://www.ncloud.com/mypage/manage/authkey)에서 키를 발급합니다.
-2. 서버는 아래 **환경변수**에서 키를 읽습니다. 두 값이 없으면 시작 시 `KeyError`로 종료됩니다.
+서버는 시작할 때 아래 순서로 인증키를 찾습니다. 키는 로그·오류 메시지에 출력되지 않습니다.
 
-| 환경변수 | 필수 | 설명 |
-|---|---|---|
-| `NCP_ACCESS_KEY` | ✅ | NCP Access Key |
-| `NCP_SECRET_KEY` | ✅ | NCP Secret Key |
-| `NCP_CA_BUNDLE` | | TLS 검증에 쓸 CA 번들 경로 (기본 `/etc/ssl/certs/ca-certificates.crt`). 사내 TLS 검사 환경에서 필요할 수 있습니다. |
+1. **환경변수** `NCP_ACCESS_KEY` + `NCP_SECRET_KEY` — 둘 다 있을 때 우선 사용 (하나만 있으면 오류)
+2. **ncloud CLI 프로필 파일** — 환경변수가 없으면 `~/.ncloud/configure`의 `NCP_PROFILE` 섹션 사용
 
-> `.env` 파일은 **자동으로 읽지 않습니다**. `.env.example`은 어떤 값이 필요한지 보여 주는 견본이며, 아래 MCP 클라이언트 설정의 `env`나 셸 환경변수로 전달하세요.
-> 인증키는 코드·`.env`·MCP 설정 파일을 **git에 커밋하지 마세요**. `.gitignore`에 `.env`, `*.pem`, `*.key`가 포함되어 있습니다.
+| 환경변수 | 설명 |
+|---|---|
+| `NCP_PROFILE` | 사용할 프로필 이름 (기본 `DEFAULT`, 대소문자 무시). 프로필이 `DEFAULT` 하나가 아니면 지정하세요. |
+| `NCP_CONFIG_FILE` | 프로필 파일 경로 (기본 `~/.ncloud/configure`) |
+| `NCP_ACCESS_KEY`, `NCP_SECRET_KEY` | 프로필 대신 직접 지정할 인증키 |
+| `NCP_CA_BUNDLE` | TLS 검증에 쓸 CA 번들 경로 (기본 `/etc/ssl/certs/ca-certificates.crt`). 사내 TLS 검사 환경에서 필요할 수 있습니다. |
+
+### 프로필 파일 형식
+
+[NCP CLI](https://cli.ncloud-docs.com)(`ncloud configure`)가 만드는 파일을 그대로 씁니다.
+
+```ini
+[DEFAULT]
+ncloud_access_key_id = <access key>
+ncloud_secret_access_key = <secret key>
+ncloud_api_url = https://ncloud.apigw.ntruss.com
+
+[other-profile]
+ncloud_access_key_id = ...
+ncloud_secret_access_key = ...
+```
+
+- 섹션끼리 값을 **상속하지 않습니다**. 프로필에 키가 하나라도 빠지면 다른 프로필 값으로 채우지 않고 오류를 냅니다.
+- 프로필에 `ncloud_api_url`이 있으면 그 주소로 API를 호출합니다(`https://`만 허용). 공공·금융 클라우드 계정은 주소가 다릅니다. 단, Object Storage 엔드포인트는 이 값을 따르지 않습니다.
+- 파일에 비밀키가 들어 있으니 `chmod 600 ~/.ncloud/configure`로 본인만 읽게 하세요.
+- 키는 NCP 콘솔 → 마이페이지 → 계정 관리 → [인증키 관리](https://www.ncloud.com/mypage/manage/authkey)에서 발급합니다.
+
+> `.env` 파일은 **자동으로 읽지 않습니다**. `.env.example`은 필요한 값을 보여 주는 견본입니다.
+> 인증키·`.env`·MCP 설정 파일을 **git에 커밋하지 마세요**. `.gitignore`에 `.env`, `*.pem`, `*.key`가 포함되어 있습니다.
 
 ## MCP 클라이언트에 등록
 
-### Claude Code
+### Claude Code (프로필 사용 — 키를 설정에 저장하지 않음)
 
 ```bash
-claude mcp add ncp \
-  -e NCP_ACCESS_KEY=<your_access_key> \
-  -e NCP_SECRET_KEY=<your_secret_key> \
+claude mcp add ncp --scope user -e NCP_PROFILE=<프로필 이름> \
   -- uv run --directory /path/to/NaverCloud-MCP ncp-mcp
 ```
+
+`DEFAULT` 프로필을 쓰면 `-e NCP_PROFILE=...`는 생략해도 됩니다. 등록 후 `/mcp`에서 `ncp`가 연결됐는지 보고 `list_vpcs`(조회 전용)로 확인하세요. 인증키가 틀리면 도구 결과에 `Authentication Failed`가 나옵니다.
 
 ### JSON 설정 (Claude Desktop 등)
 
@@ -77,16 +100,13 @@ claude mcp add ncp \
     "ncp": {
       "command": "uv",
       "args": ["run", "--directory", "/path/to/NaverCloud-MCP", "ncp-mcp"],
-      "env": {
-        "NCP_ACCESS_KEY": "<your_access_key>",
-        "NCP_SECRET_KEY": "<your_secret_key>"
-      }
+      "env": { "NCP_PROFILE": "<프로필 이름>" }
     }
   }
 }
 ```
 
-`/path/to/NaverCloud-MCP`는 클론한 절대 경로로 바꾸세요. 직접 실행해 보려면 키를 환경변수로 넣고 `uv run ncp-mcp`(또는 `uv run python ncp_server.py`)를 실행합니다. stdio 서버라 입력을 기다리며 멈춰 있는 것이 정상입니다.
+`/path/to/NaverCloud-MCP`는 클론한 절대 경로로 바꾸세요. 프로필 파일을 쓰지 않으려면 `env`에 `NCP_ACCESS_KEY`·`NCP_SECRET_KEY`를 넣으면 되지만, 그러면 키가 설정 파일에 평문으로 남습니다. 직접 실행해 보려면 `uv run ncp-mcp`를 쓰세요. stdio 서버라 입력을 기다리며 멈춰 있는 것이 정상입니다.
 
 ## 개발
 

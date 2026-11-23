@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import base64
 import ssl
+import configparser
 from typing import Optional
 from urllib.parse import urlencode
 import requests
@@ -12,8 +13,64 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("ncp-server")
 
 BASE_URL   = "https://ncloud.apigw.ntruss.com"
-ACCESS_KEY = os.environ["NCP_ACCESS_KEY"]
-SECRET_KEY = os.environ["NCP_SECRET_KEY"]
+
+
+def _load_credentials() -> tuple:
+    """NCP 인증 정보를 (access_key, secret_key, api_url)로 반환한다. api_url 은 프로필에 있을 때만 값이 있다. 값은 로그·오류에 노출하지 않는다.
+
+    우선순위:
+      1. 환경변수 NCP_ACCESS_KEY / NCP_SECRET_KEY (둘 다 비어 있지 않을 때)
+      2. ncloud CLI 프로필 파일 — NCP_CONFIG_FILE (기본 ~/.ncloud/configure) 의
+         NCP_PROFILE 섹션 (기본 DEFAULT)
+         키 이름: ncloud_access_key_id / ncloud_secret_access_key
+    """
+    ak = os.environ.get("NCP_ACCESS_KEY", "").strip()
+    sk = os.environ.get("NCP_SECRET_KEY", "").strip()
+    if ak and sk:
+        return ak, sk, ""
+    if ak or sk:
+        raise RuntimeError(
+            "NCP_ACCESS_KEY / NCP_SECRET_KEY 는 둘 다 설정하거나 둘 다 비워야 합니다. "
+            "비우면 ~/.ncloud/configure 프로필을 사용합니다.")
+
+    path = os.path.expanduser(os.environ.get("NCP_CONFIG_FILE", "~/.ncloud/configure"))
+    profile = os.environ.get("NCP_PROFILE", "").strip() or "DEFAULT"
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            f"NCP 인증키를 찾을 수 없습니다. 환경변수 NCP_ACCESS_KEY/NCP_SECRET_KEY 를 "
+            f"설정하거나 프로필 파일({path})을 준비하세요.")
+
+    # interpolation=None: 시크릿에 '%' 가 있어도 파싱 오류가 나지 않도록 한다.
+    # default_section 을 쓰지 않는 값으로 바꿔 [DEFAULT] 를 일반 섹션으로 읽는다
+    # (configparser 기본 동작은 DEFAULT 값을 다른 섹션에 상속시켜 키가 섞일 수 있음).
+    cp = configparser.ConfigParser(interpolation=None, default_section="\0")
+    try:
+        cp.read(path, encoding="utf-8")
+    except configparser.Error as e:
+        raise RuntimeError(f"프로필 파일({path}) 형식이 올바르지 않습니다: {type(e).__name__}") from None
+
+    match = next((s for s in cp.sections() if s == profile), None) \
+        or next((s for s in cp.sections() if s.lower() == profile.lower()), None)
+    if match is None:
+        raise RuntimeError(
+            f"프로필 '{profile}' 이(가) {path} 에 없습니다. 사용 가능한 프로필: {cp.sections()}")
+    section = cp[match]
+
+    ak = (section.get("ncloud_access_key_id") or section.get("access_key") or "").strip()
+    sk = (section.get("ncloud_secret_access_key") or section.get("secret_key") or "").strip()
+    if not ak or not sk:
+        raise RuntimeError(
+            f"프로필 '{profile}' 에 ncloud_access_key_id / ncloud_secret_access_key 가 없습니다 ({path}).")
+    # 공공/금융 클라우드 등 API 엔드포인트가 다른 계정은 프로필의 ncloud_api_url 을 따른다 (https 만 허용).
+    api_url = (section.get("ncloud_api_url") or "").strip().rstrip("/")
+    if api_url and not api_url.startswith("https://"):
+        raise RuntimeError(f"프로필 '{match}' 의 ncloud_api_url 은 https:// 로 시작해야 합니다.")
+    return ak, sk, api_url
+
+
+ACCESS_KEY, SECRET_KEY, _PROFILE_API_URL = _load_credentials()
+if _PROFILE_API_URL:
+    BASE_URL = _PROFILE_API_URL
 
 # NCP VPC 자주 쓰는 서버 이미지 / 스펙 코드 매핑 (KR 리전, 2026-05-14 NCP API 검증).
 # Rocky Linux 9 이미지는 KR·SGN·JPN·USWN 어디에도 제공되지 않으므로 매핑 없음.
